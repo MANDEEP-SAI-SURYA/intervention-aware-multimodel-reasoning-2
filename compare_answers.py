@@ -20,10 +20,13 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
+import re
+from math import erf, sqrt
 
 import pandas as pd
 
 RESULTS_DIR = "results"
+DEFAULT_SEED = 42
 FULL_CSV = os.path.join(RESULTS_DIR, "val_predictions.csv")
 NOGRAPH_CSV = os.path.join(RESULTS_DIR, "val_predictions_nograph.csv")
 FULL_CKPT = "checkpoints/scm_vlm_latest.pt"
@@ -38,6 +41,79 @@ def answer_type(answer: str) -> str:
     if answer.replace(".", "", 1).isdigit():
         return "number"
     return "other"
+
+
+# Question kinds (keyword heuristics on the question text).  "relational" questions can only be
+# answered by relating two or more objects, which is what the causal graph is meant to model.
+SPATIAL = re.compile(r"\b(left|right|behind|in front of|next to|beside|besides|near|nearest|closest|close to|"
+                     r"far from|above|below|under|underneath|beneath|over|on top of|between|inside|"
+                     r"in the middle of|across from|around|on (the|his|her|their|a|an|its|this|that))\b", re.I)
+INTERACTION = re.compile(r"\b(rid(e|es|ing)|hold(s|ing)?|carr(y|ies|ying)|wear(s|ing)?|pull(s|ing)?|"
+                         r"push(es|ing)?|sit(s|ting)? on|stand(s|ing)? on|ly(ing)? on|lay(ing)? on|lean(s|ing)?|"
+                         r"eat(s|ing)?|drink(s|ing)?|play(s|ing)? with|throw(s|ing)?|catch(es|ing)?|"
+                         r"chas(e|es|ing)|feed(s|ing)?|us(e|es|ing)|look(s|ing)? at|touch(es|ing)?|"
+                         r"attached|hang(s|ing)?|parked|pulled by|covered)\b", re.I)
+
+
+def question_kind(question: str) -> str:
+    question = str(question)
+    if INTERACTION.search(question):
+        return "interaction"
+    if SPATIAL.search(question):
+        return "spatial"
+    return "non-relational"
+
+
+def mcnemar(only_full: int, only_nograph: int) -> tuple[float, float]:
+    """Paired test on the questions where exactly one model is right (continuity corrected)."""
+    discordant = only_full + only_nograph
+    if discordant == 0:
+        return 0.0, 1.0
+    z = max(abs(only_full - only_nograph) - 1, 0) / sqrt(discordant)
+    return z, 2 * (1 - 0.5 * (1 + erf(z / sqrt(2))))
+
+
+def print_group_table(merged: pd.DataFrame, column: str, title: str) -> pd.DataFrame:
+    rows = []
+    for group, part in merged.groupby(column):
+        only_full = int(((part.correct_full == 1) & (part.correct_nograph == 0)).sum())
+        only_nograph = int(((part.correct_full == 0) & (part.correct_nograph == 1)).sum())
+        _, p = mcnemar(only_full, only_nograph)
+        rows.append({column: group, "questions": len(part),
+                     "full %": 100 * part.correct_full.mean(), "no graph %": 100 * part.correct_nograph.mean(),
+                     "gap": 100 * (part.correct_full.mean() - part.correct_nograph.mean()),
+                     "only full": only_full, "only no-graph": only_nograph, "p": p,
+                     "sig.": "*" if p < 0.05 else ""})
+    table = pd.DataFrame(rows).set_index(column)
+    print(f"\n{title} (%; p = McNemar, * = significant at 0.05):")
+    print(table.round({"full %": 2, "no graph %": 2, "gap": 2, "p": 4}).to_string())
+    return table
+
+
+def summarize_seeds(seeds: list[int]) -> None:
+    """Accuracy of both models over several training seeds (python train.py --seed N ...)."""
+    rows = []
+    for seed in seeds:
+        suffix = "" if seed == DEFAULT_SEED else f"_s{seed}"
+        files = {"full": os.path.join(RESULTS_DIR, f"val_predictions{suffix}.csv"),
+                 "no graph": os.path.join(RESULTS_DIR, f"val_predictions_nograph{suffix}.csv")}
+        for model, path in files.items():
+            if not os.path.isfile(path):
+                print(f"missing {path} - skipped")
+                continue
+            frame = pd.read_csv(path)
+            relational = frame["question"].map(question_kind).ne("non-relational")
+            rows.append({"seed": seed, "model": model, "accuracy": 100 * frame.correct.mean(),
+                         "relational": 100 * frame.correct[relational].mean(),
+                         "non-relational": 100 * frame.correct[~relational].mean()})
+    if not rows:
+        raise SystemExit("no prediction files found")
+    table = pd.DataFrame(rows)
+    print("\nPer seed (%):")
+    print(table.round(2).to_string(index=False))
+    summary = table.groupby("model")[["accuracy", "relational", "non-relational"]].agg(["mean", "std"])
+    print("\nMean +- std over seeds (%):")
+    print(summary.round(2).to_string())
 
 
 def compare_csv(full_csv: str, nograph_csv: str, examples: int) -> None:
@@ -59,6 +135,7 @@ def compare_csv(full_csv: str, nograph_csv: str, examples: int) -> None:
               f"(full {len(full)}, no-graph {len(nograph)}).")
 
     merged["answer_type"] = merged["ground_truth"].map(answer_type)
+    merged["question_kind"] = merged["question"].map(question_kind)
     merged["agree"] = (merged["prediction_full"] == merged["prediction_nograph"]).astype(int)
     for name in ("full", "nograph"):
         merged[f"stable_{name}"] = (merged[f"prediction_{name}"] ==
@@ -74,24 +151,18 @@ def compare_csv(full_csv: str, nograph_csv: str, examples: int) -> None:
     print(f"{'Answer kept under do() (%)':28s}{100 * merged.stable_full.mean():10.2f}"
           f"{100 * merged.stable_nograph.mean():12.2f}")
 
-    print("\nAccuracy by answer type (%):")
-    by_type = merged.groupby("answer_type").agg(
-        questions=("question_index", "size"),
-        full=("correct_full", "mean"),
-        no_graph=("correct_nograph", "mean"),
-    )
-    by_type[["full", "no_graph"]] *= 100
-    print(by_type.round(2).to_string())
-
-    bins = pd.cut(merged["num_objects"], bins=[0, 3, 6, 9, 100], labels=["1-3", "4-6", "7-9", "10+"])
-    by_objects = merged.groupby(bins, observed=True).agg(
-        questions=("question_index", "size"),
-        full=("correct_full", "mean"),
-        no_graph=("correct_nograph", "mean"),
-    )
-    by_objects[["full", "no_graph"]] *= 100
-    print("\nAccuracy by number of detected objects (%):")
-    print(by_objects.round(2).to_string())
+    print_group_table(merged, "answer_type", "Accuracy by answer type")
+    print_group_table(merged, "question_kind", "Accuracy by question kind (relational = asks about "
+                      "how objects relate: spatial position or interaction)")
+    merged["relational"] = merged["question_kind"].ne("non-relational").map(
+        {True: "relational", False: "non-relational"})
+    print_group_table(merged, "relational", "Relational vs non-relational questions")
+    merged["objects"] = pd.cut(merged["num_objects"], bins=[0, 3, 6, 9, 100],
+                               labels=["1-3", "4-6", "7-9", "10+"]).astype(str)
+    print_group_table(merged, "objects", "Accuracy by number of detected objects")
+    merged["scene"] = (merged["num_objects"] >= 4).map({True: "4+ objects", False: "1-3 objects"})
+    merged["relational_scene"] = merged["relational"] + ", " + merged["scene"]
+    print_group_table(merged, "relational_scene", "Relational questions in busy scenes")
 
     both = int(((merged.correct_full == 1) & (merged.correct_nograph == 1)).sum())
     only_full = int(((merged.correct_full == 1) & (merged.correct_nograph == 0)).sum())
@@ -102,14 +173,9 @@ def compare_csv(full_csv: str, nograph_csv: str, examples: int) -> None:
     print(f"Only full model correct      : {only_full}")
     print(f"Only no-graph model correct  : {only_nograph}")
     print(f"Both wrong                   : {neither}")
-    # McNemar test on the disagreements (is the accuracy difference more than noise?)
-    discordant = only_full + only_nograph
-    if discordant:
-        from math import erf, sqrt
-        z = (abs(only_full - only_nograph) - 1) / sqrt(discordant)
-        p = 2 * (1 - 0.5 * (1 + erf(max(z, 0) / sqrt(2))))
-        print(f"McNemar test                 : z={z:.2f}, p={p:.4f} "
-              f"({'significant' if p < 0.05 else 'not significant'} at 0.05)")
+    z, p = mcnemar(only_full, only_nograph)
+    print(f"McNemar test                 : z={z:.2f}, p={p:.4f} "
+          f"({'significant' if p < 0.05 else 'not significant'} at 0.05)")
 
     diff = merged[merged.agree == 0]
     if examples and not diff.empty:
@@ -165,9 +231,13 @@ def main() -> None:
     parser.add_argument("--nograph-csv", default=NOGRAPH_CSV)
     parser.add_argument("--examples", type=int, default=25, help="differing examples to print")
     parser.add_argument("--top", type=int, default=3, help="answers to show per model with --image")
+    parser.add_argument("--seeds", type=int, nargs="+",
+                        help="summarise runs made with train.py --seed N (e.g. --seeds 42 1 2)")
     args = parser.parse_args()
 
-    if args.image:
+    if args.seeds:
+        summarize_seeds(args.seeds)
+    elif args.image:
         if not args.question:
             parser.error("give at least one --question with --image")
         compare_live(args.image, args.question, args.full_checkpoint, args.nograph_checkpoint, args.top)

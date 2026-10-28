@@ -71,6 +71,30 @@ are unchanged. Outputs use a `_nograph` suffix (`results/final_metrics_nograph.c
 `compare_answers.py` reports accuracy per answer type, agreement, questions only one model gets right
 (McNemar test) and example disagreements. `whatif_qa.py` needs the graph and always uses the full model.
 
+## Does the causal graph learn relationships?
+
+```bash
+python train.py --seed 1 ...; python train.py --seed 1 --graph-mode none ...   # extra seeds
+python compare_answers.py --seeds 42 1 2       # mean +- std over seeds, relational vs other
+python relation_analysis.py --samples 3000     # knock-out, edge alignment, relation probes
+python explain_reasoning.py --image images/Man_riding_bicycle.png --question "What is the man riding?"
+```
+
+* `compare_answers.py` also splits accuracy into relational questions (spatial / interaction)
+  and non-relational ones, with a McNemar test per group.
+* `relation_analysis.py` (1) switches off or scrambles the trained full model's graph at test time,
+  (2) checks whether each object's strongest learned parent touches it / sits above or below it
+  versus chance, and (3) trains linear probes to read relational facts (touches a person, number of
+  same-class objects, object above) from a single object's representation: raw DETR vs full model vs
+  no-graph model.
+* `explain_reasoning.py` prints and draws, for both models, the answer, which objects the answer
+  head attended to, how much each object matters (answer change when it is removed), the reasoning
+  chain through the graph and the answer with message passing switched off.
+
+> **DETR feature fix:** object embeddings are now taken from the DETR query that produced each
+> detection (before, they came from unrelated queries). Cached features are rebuilt automatically;
+> retrain both models before comparing.
+
 ## Run on any image
 
 ```bash

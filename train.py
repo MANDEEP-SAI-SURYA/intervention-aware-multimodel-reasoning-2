@@ -55,6 +55,7 @@ RESULTS_DIR = "results"
 CHECKPOINT_DIR = "checkpoints"
 CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "scm_vlm_latest.pt")
 CACHE_DIR = Path("cache")
+FEATURE_VERSION = 2        # 2 = DETR embeddings taken from the query that made each detection
 
 IMAGE_DIR = "coco/train2014/train2014"
 QUESTION_FILE = "coco/vqa/v2_OpenEnded_mscoco_train2014_questions.json"
@@ -104,10 +105,12 @@ class FeatureCache:
     def image(self, image_path: str) -> tuple[torch.Tensor, torch.Tensor]:
         """DETR object embeddings [N, 256] and boxes [N, 4] (x0, y0, x1, y1 scaled to 0-1).
         Cache files from the earlier version have no boxes and are recomputed once."""
-        path = self.image_dir / f"{_key(os.path.abspath(image_path))}.pt"
+        path = self.path(image_path)
         if path.is_file():
             item = torch.load(path, map_location="cpu", weights_only=False)
-            if "boxes" in item:
+            # files written before the DETR query-index fix hold embeddings of the wrong
+            # queries; they have no "feature_version" and are recomputed once
+            if "boxes" in item and item.get("feature_version", 1) >= FEATURE_VERSION:
                 return item["embeddings"], item["boxes"]
         output = self.model.vision(image_path)
         embeddings = output["embeddings"][0].detach().cpu()
@@ -115,8 +118,16 @@ class FeatureCache:
         with Image.open(image_path) as image:
             width, height = image.size
         boxes = boxes / torch.tensor([width, height, width, height], dtype=torch.float)
-        torch.save({"embeddings": embeddings, "labels": output["labels"][0], "boxes": boxes}, path)
+        torch.save({"embeddings": embeddings, "labels": output["labels"][0], "boxes": boxes,
+                    "feature_version": FEATURE_VERSION}, path)
         return embeddings, boxes
+
+    def path(self, image_path: str) -> Path:
+        return self.image_dir / f"{_key(os.path.abspath(image_path))}.pt"
+
+    def labels(self, image_path: str) -> list[str]:
+        """DETR class names of the cached objects (call image() first)."""
+        return torch.load(self.path(image_path), map_location="cpu", weights_only=False)["labels"]
 
     @torch.no_grad()
     def question(self, question: str) -> torch.Tensor:
@@ -369,16 +380,22 @@ def main() -> None:
                              "legacy: the original hard-threshold graph (collapsed in practice). "
                              "none: ablation without the causal graph (no edges, no message passing, "
                              "no DAG/sparsity/edge losses)")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help="seed for weight init and sample order (the data split is fixed)")
     parser.add_argument("--tag", default=None,
                         help="suffix for checkpoint/results files so runs do not overwrite each other "
                              "(default: none for the full model, 'nograph' for --graph-mode none)")
     args = parser.parse_args()
     tag = args.tag if args.tag is not None else ("nograph" if args.graph_mode == "none" else "")
+    if args.tag is None and args.seed != SEED:
+        tag = f"{tag}_s{args.seed}" if tag else f"s{args.seed}"
     suffix = f"_{tag}" if tag else ""
     checkpoint_path = os.path.join(CHECKPOINT_DIR, f"scm_vlm_latest{suffix}.pt") if suffix else CHECKPOINT_PATH
 
-    random.seed(SEED)
-    torch.manual_seed(SEED)
+    # --seed changes weight init and sample order only; the train/validation split always
+    # uses SEED, so every run (full / no graph / any seed) is scored on the same questions
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     if args.no_cf:

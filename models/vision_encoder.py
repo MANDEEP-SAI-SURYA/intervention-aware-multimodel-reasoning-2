@@ -15,6 +15,19 @@ from configs.config import (
 )
 
 
+DETECTION_THRESHOLD = 0.9
+
+
+def kept_query_indices(logits: torch.Tensor, threshold: float = DETECTION_THRESHOLD) -> list[torch.Tensor]:
+    """DETR query index of every detection that ``post_process_object_detection`` keeps,
+    in the same order as its output.  logits: [B, Q, C+1] (last class = no object).
+
+    post_process returns only the kept detections, so position r in its output is NOT
+    query r.  The decoder embedding of detection r is ``decoder_hidden[b, kept[b][r]]``."""
+    scores = torch.softmax(logits, dim=-1)[..., :-1].max(dim=-1).values
+    return [torch.nonzero(row > threshold, as_tuple=False).flatten() for row in scores]
+
+
 class VisionEncoder(nn.Module):
     """
     DETR-based vision encoder.
@@ -114,9 +127,14 @@ class VisionEncoder(nn.Module):
 
         results = self.processor.post_process_object_detection(
             outputs,
-            threshold=0.9,
+            threshold=DETECTION_THRESHOLD,
             target_sizes=target_sizes
         )
+        # FIX: map each kept detection back to the DETR query that produced it.
+        # The earlier version indexed the decoder states with the position in the
+        # *filtered* list, so the node embeddings belonged to other queries (mostly
+        # "no object" queries) and did not match the detected labels / boxes.
+        query_indices = kept_query_indices(outputs.logits, DETECTION_THRESHOLD)
 
         labels = []
         boxes = []
@@ -152,7 +170,7 @@ class VisionEncoder(nn.Module):
 
             filtered_object_embeddings = object_embeddings[
                 batch_index,
-                top_indices,
+                query_indices[batch_index].to(top_indices.device)[top_indices],
                 :
             ]
 
